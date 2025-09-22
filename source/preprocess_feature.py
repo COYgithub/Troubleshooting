@@ -8,6 +8,7 @@
 3. 滑动窗口分段处理
 4. 提取时域、频域、包络谱和时频特征
 5. 保存特征到CSV文件
+6. 添加检查点机制，保存每个文件的处理结果
 """
 import joblib
 import os
@@ -16,16 +17,24 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import io, signal
 from scipy.fft import fft, fftfreq
-from scipy.signal import hilbert, stft, resample
+from scipy.signal import hilbert, stft, resample, butter, lfilter
 import pywt
 from sklearn.preprocessing import StandardScaler
 import warnings
+import re
+import logging
+import uuid
 
 warnings.filterwarnings('ignore')
+
+# 设置日志
+logging.basicConfig(filename='processing.log', level=logging.INFO, encoding='utf-8',
+                    format='%(asctime)s %(levelname)s %(message)s')
 
 code_dir = os.getcwd()
 root_dir = os.path.dirname(code_dir)
 data_dir = os.path.join(root_dir, '数据集')
+
 
 class BearingDataProcessor:
     """轴承数据处理类"""
@@ -90,7 +99,7 @@ class BearingDataProcessor:
 
     def read_mat_file(self, file_path):
         """
-        读取.mat文件（适配您的数据集格式）
+        读取.mat文件（适配源域和目标域数据集格式）
 
         Args:
             file_path: 文件路径
@@ -122,45 +131,52 @@ class BearingDataProcessor:
                     else:
                         data['RPM'] = float(rpm_val)
 
-            # 从文件名推断故障类型和尺寸
+            # 如果没有传感器数据，假设是目标域单一信号
+            if not any(k in data for k in ['DE', 'FE', 'BA']):
+                if data_keys:
+                    data['signal'] = mat_data[data_keys[0]].flatten()  # 取第一个数据作为信号
+
+            # 从文件名推断故障信息
             filename = os.path.basename(file_path)
             data['fault_info'] = self._parse_filename(filename)
 
             # 根据数据长度推断采样率
-            if 'DE' in data:
-                data_length = len(data['DE'])
+            if 'DE' in data or 'signal' in data:
+                signal_key = 'DE' if 'DE' in data else 'signal'
+                data_length = len(data[signal_key])
                 # 48kHz数据通常长度更长
                 if data_length > 100000:
                     data['fs'] = 48000
+                elif data_length > 50000:  # 目标域32kHz, 8秒数据约256000点，但重采样后调整
+                    data['fs'] = 32000
                 else:
                     data['fs'] = 12000
-            elif 'FE' in data:
-                data_length = len(data['FE'])
-                data['fs'] = 12000  # FE数据通常是12kHz
             else:
                 data['fs'] = 48000  # 默认
 
-            print(f"读取文件: {filename}")
-            print(f"  数据键: {list(data.keys())}")
+            logging.info(f"读取文件: {filename}")
+            logging.info(f"  数据键: {list(data.keys())}")
             if 'DE' in data:
-                print(f"  DE数据长度: {len(data['DE'])}")
+                logging.info(f"  DE数据长度: {len(data['DE'])}")
             if 'FE' in data:
-                print(f"  FE数据长度: {len(data['FE'])}")
+                logging.info(f"  FE数据长度: {len(data['FE'])}")
             if 'BA' in data:
-                print(f"  BA数据长度: {len(data['BA'])}")
-            print(f"  采样率: {data['fs']} Hz")
+                logging.info(f"  BA数据长度: {len(data['BA'])}")
+            if 'signal' in data:
+                logging.info(f"  信号数据长度: {len(data['signal'])}")
+            logging.info(f"  采样率: {data['fs']} Hz")
             if 'RPM' in data:
-                print(f"  转速: {data['RPM']} RPM")
+                logging.info(f"  转速: {data['RPM']} RPM")
 
             return data
 
         except Exception as e:
-            print(f"读取.mat文件出错 {file_path}: {e}")
+            logging.error(f"读取.mat文件出错 {file_path}: {e}")
             return None
 
     def _parse_filename(self, filename):
         """
-        解析文件名获取故障信息
+        解析文件名获取故障信息和转速
 
         Args:
             filename: 文件名
@@ -172,7 +188,8 @@ class BearingDataProcessor:
             'fault_type': 'N',  # 默认正常
             'fault_size': 0,
             'load': 0,
-            'position': None
+            'position': None,
+            'rpm': None
         }
 
         # 移除扩展名
@@ -214,6 +231,11 @@ class BearingDataProcessor:
             elif 'OPPOSITE' in name:
                 info['position'] = 'Opposite'
 
+        # 解析转速
+        rpm_match = re.search(r'\((\d+)RPM\)', name)
+        if rpm_match:
+            info['rpm'] = int(rpm_match.group(1))
+
         return info
 
     def read_csv_txt_file(self, file_path):
@@ -242,12 +264,12 @@ class BearingDataProcessor:
             }
 
         except Exception as e:
-            print(f"读取文件出错: {e}")
+            logging.error(f"读取文件出错: {e}")
             return None
 
     def resample_signal(self, signal_data, original_fs):
         """
-        重采样信号到目标采样率
+        重采样信号到目标采样率，添加抗混叠滤波
 
         Args:
             signal_data: 原始信号
@@ -257,29 +279,43 @@ class BearingDataProcessor:
             重采样后的信号
         """
         if original_fs != self.target_fs:
+            # 设计低通滤波器，截止频率为原始采样率奈奎斯特频率的90%
+            nyquist = original_fs / 2
+            cutoff = 0.9 * nyquist  # 确保小于Nyquist频率
+            b, a = butter(5, cutoff / nyquist, btype='low')
+            filtered_signal = lfilter(b, a, signal_data)
             num_samples = int(len(signal_data) * self.target_fs / original_fs)
-            resampled_signal = resample(signal_data, num_samples)
+            resampled_signal = resample(filtered_signal, num_samples)
             return resampled_signal
         return signal_data
 
-    def sliding_window_segmentation(self, signal_data):
+    def sliding_window_segmentation(self, signal_data, rpm):
         """
-        滑动窗口分段
+        滑动窗口分段，动态调整窗口大小以覆盖至少10个旋转周期
 
         Args:
             signal_data: 输入信号
+            rpm: 转速 (RPM)
 
         Returns:
             list: 分段后的信号列表
         """
+        cycles_per_window = 10
+        fr = rpm / 60  # 旋转频率 (Hz)
+        if fr == 0:
+            fr = 30  # 默认30Hz避免除零
+        self.window_samples = int(cycles_per_window * self.target_fs / fr)
+        self.step_samples = int(self.window_samples / 2)
         segments = []
         start_idx = 0
-
         while start_idx + self.window_samples <= len(signal_data):
             segment = signal_data[start_idx:start_idx + self.window_samples]
             segments.append(segment)
             start_idx += self.step_samples
-
+        # 如果信号太短，使用零填充
+        if not segments and len(signal_data) > 0:
+            padded = np.pad(signal_data, (0, self.window_samples - len(signal_data)))
+            segments.append(padded)
         return segments
 
     def extract_time_features(self, segment):
@@ -303,10 +339,11 @@ class BearingDataProcessor:
         features['kurtosis'] = self._kurtosis(segment)
 
         # 形状指标
-        features['crest_factor'] = features['peak'] / features['rms']
-        features['impulse_factor'] = features['peak'] / np.mean(np.abs(segment))
-        features['shape_factor'] = features['rms'] / np.mean(np.abs(segment))
-        features['clearance_factor'] = features['peak'] / (np.mean(np.sqrt(np.abs(segment)))) ** 2
+        features['crest_factor'] = features['peak'] / features['rms'] if features['rms'] != 0 else 0
+        features['impulse_factor'] = features['peak'] / np.mean(np.abs(segment)) if np.mean(np.abs(segment)) != 0 else 0
+        features['shape_factor'] = features['rms'] / np.mean(np.abs(segment)) if np.mean(np.abs(segment)) != 0 else 0
+        features['clearance_factor'] = features['peak'] / (np.mean(np.sqrt(np.abs(segment)))) ** 2 if np.mean(
+            np.sqrt(np.abs(segment))) != 0 else 0
 
         return features
 
@@ -315,14 +352,20 @@ class BearingDataProcessor:
         n = len(x)
         mean = np.mean(x)
         std = np.std(x)
-        return np.sum(((x - mean) / std) ** 3) / n if std > 0 else 0
+        if std == 0:
+            logging.warning("标准差为0，无法计算偏度")
+            return 0
+        return np.sum(((x - mean) / std) ** 3) / n
 
     def _kurtosis(self, x):
         """计算峭度"""
         n = len(x)
         mean = np.mean(x)
         std = np.std(x)
-        return np.sum(((x - mean) / std) ** 4) / n - 3 if std > 0 else 0
+        if std == 0:
+            logging.warning("标准差为0，无法计算峭度")
+            return 0
+        return np.sum(((x - mean) / std) ** 4) / n - 3
 
     def extract_frequency_features(self, segment, bearing_freqs=None):
         """
@@ -347,10 +390,11 @@ class BearingDataProcessor:
         features['total_energy'] = np.sum(power_spectrum)
 
         # 谱质心和谱带宽
-        features['spectral_centroid'] = np.sum(freqs * fft_magnitude) / np.sum(fft_magnitude)
+        total_mag = np.sum(fft_magnitude)
+        features['spectral_centroid'] = np.sum(freqs * fft_magnitude) / total_mag if total_mag > 0 else 0
         centroid = features['spectral_centroid']
         features['spectral_bandwidth'] = np.sqrt(
-            np.sum(((freqs - centroid) ** 2) * fft_magnitude) / np.sum(fft_magnitude))
+            np.sum(((freqs - centroid) ** 2) * fft_magnitude) / total_mag) if total_mag > 0 else 0
 
         # 频带能量分布
         freq_bands = [(0, 1000), (1000, 5000), (5000, 10000), (10000, 24000)]
@@ -358,24 +402,21 @@ class BearingDataProcessor:
             band_mask = (freqs >= low) & (freqs <= high)
             features[f'energy_band_{i + 1}'] = np.sum(power_spectrum[band_mask])
 
-        # 轴承特征频率处的幅值
+        # 轴承特征频率处的幅值和能量
         if bearing_freqs:
+            freq_range = 10  # Hz 范围
             for freq_name, freq_val in bearing_freqs.items():
                 if freq_val < self.target_fs / 2:  # 低于奈奎斯特频率
-                    # 找最近频率点
-                    freq_idx = np.argmin(np.abs(freqs - freq_val))
-                    features[f'{freq_name}_amplitude'] = fft_magnitude[freq_idx]
-
-                    # 在特征频率附近的能量
-                    freq_range = 10  # Hz
+                    # 附近范围最大幅值
                     freq_mask = (freqs >= freq_val - freq_range) & (freqs <= freq_val + freq_range)
+                    features[f'{freq_name}_amplitude'] = np.max(fft_magnitude[freq_mask]) if np.any(freq_mask) else 0
                     features[f'{freq_name}_energy'] = np.sum(power_spectrum[freq_mask])
 
         return features
 
     def extract_envelope_features(self, segment):
         """
-        提取包络谱特征
+        提取包络谱特征，添加带通滤波
 
         Args:
             segment: 信号段
@@ -385,8 +426,12 @@ class BearingDataProcessor:
         """
         features = {}
 
+        # 带通滤波 (1kHz-10kHz)
+        b, a = butter(5, [1000 / (self.target_fs / 2), 10000 / (self.target_fs / 2)], btype='band')
+        filtered_segment = lfilter(b, a, segment)
+
         # Hilbert变换获取包络
-        analytic_signal = hilbert(segment)
+        analytic_signal = hilbert(filtered_segment)
         envelope = np.abs(analytic_signal)
 
         # 包络统计特征
@@ -404,11 +449,9 @@ class BearingDataProcessor:
         features['envelope_spectral_energy'] = np.sum(envelope_magnitude ** 2)
 
         # 包络谱质心
-        if np.sum(envelope_magnitude) > 0:
-            features['envelope_spectral_centroid'] = np.sum(envelope_freqs * envelope_magnitude) / np.sum(
-                envelope_magnitude)
-        else:
-            features['envelope_spectral_centroid'] = 0
+        total_env_mag = np.sum(envelope_magnitude)
+        features['envelope_spectral_centroid'] = np.sum(
+            envelope_freqs * envelope_magnitude) / total_env_mag if total_env_mag > 0 else 0
 
         return features
 
@@ -426,8 +469,9 @@ class BearingDataProcessor:
         """
         features = {}
 
-        # STFT
-        f_stft, t_stft, Zxx = stft(segment, fs=self.target_fs, nperseg=1024)
+        # STFT，动态nperseg
+        nperseg = min(1024, len(segment) // 4)  # 根据信号长度调整
+        f_stft, t_stft, Zxx = stft(segment, fs=self.target_fs, nperseg=nperseg)
         stft_magnitude = np.abs(Zxx)
 
         # STFT特征
@@ -445,8 +489,8 @@ class BearingDataProcessor:
             features['time_concentration'] = 0
             features['freq_concentration'] = 0
 
-        # 连续小波变换 (CWT)
-        scales = np.arange(1, 128)
+        # 连续小波变换 (CWT)，动态尺度
+        scales = np.arange(1, min(128, len(segment) // 10))
         wavelet = 'cmor'
         coefficients, frequencies = pywt.cwt(segment, scales, wavelet, sampling_period=1 / self.target_fs)
         cwt_magnitude = np.abs(coefficients)
@@ -455,7 +499,7 @@ class BearingDataProcessor:
         features['cwt_energy'] = np.sum(cwt_magnitude ** 2)
         features['cwt_peak_freq'] = frequencies[np.unravel_index(np.argmax(cwt_magnitude), cwt_magnitude.shape)[0]]
 
-        # 保存时频图
+        # 保存时频图（可选仅保存代表性图像）
         if save_images and filename_prefix:
             self._save_timefreq_plots(segment, f_stft, t_stft, stft_magnitude,
                                       frequencies, cwt_magnitude, filename_prefix)
@@ -497,7 +541,7 @@ class BearingDataProcessor:
         plt.savefig(f'{prefix}_timefreq.png', dpi=150, bbox_inches='tight')
         plt.close()
 
-    def process_file(self, file_path, label=None, rpm=None, save_images=False):
+    def process_file(self, file_path, label=None, rpm=None, save_images=True):
         """
         处理单个文件
 
@@ -510,104 +554,94 @@ class BearingDataProcessor:
         Returns:
             pd.DataFrame: 特征数据框
         """
-        print(f"\n处理文件: {file_path}")
+        logging.info(f"处理文件: {file_path}")
+        filename = os.path.basename(file_path)
 
-        # 读取文件
         if file_path.endswith('.mat'):
             data = self.read_mat_file(file_path)
-            if data is None:
-                return None
-
-            # 获取标签信息
-            if label is None:
-                label = data['fault_info']['fault_type']
-
-            # 获取转速信息
-            if rpm is None:
-                rpm = data.get('RPM', 1797)  # 默认转速
-
-            # 处理多传感器数据
-            all_features = []
-            sensors = ['DE', 'FE', 'BA']
-
-            for sensor in sensors:
-                if sensor in data:
-                    signal_data = data[sensor]
-                    original_fs = data.get('fs', 12000)
-
-                    print(f"  处理{sensor}传感器数据，原始采样率: {original_fs} Hz")
-
-                    # 重采样
-                    resampled_signal = self.resample_signal(signal_data, original_fs)
-                    print(f"  重采样后长度: {len(resampled_signal)} 点")
-
-                    # 分段处理
-                    segments = self.sliding_window_segmentation(resampled_signal)
-                    print(f"  分段数量: {len(segments)}")
-
-                    # 确定轴承类型
-                    bearing_type = 'SKF6205' if sensor == 'DE' else 'SKF6203'
-
-                    # 计算轴承特征频率
-                    bearing_freqs = self.calculate_bearing_frequencies(rpm, bearing_type)
-
-                    # 提取特征
-                    features_list = []
-                    for i, segment in enumerate(segments):
-                        features = {}
-                        features['file'] = os.path.basename(file_path)
-                        features['sensor'] = sensor
-                        features['segment'] = i
-                        features['label'] = label
-                        features['fault_size'] = data['fault_info']['fault_size']
-                        features['load'] = data['fault_info']['load']
-                        features['position'] = data['fault_info']['position']
-                        features['rpm'] = rpm
-                        features['bearing_type'] = bearing_type
-
-                        # 各类特征
-                        time_features = self.extract_time_features(segment)
-                        freq_features = self.extract_frequency_features(segment, bearing_freqs)
-                        envelope_features = self.extract_envelope_features(segment)
-
-                        filename_prefix = f"{os.path.splitext(os.path.basename(file_path))[0]}_{sensor}_seg{i}"
-                        timefreq_features = self.extract_timefreq_features(segment, save_images, filename_prefix)
-
-                        # 合并特征
-                        features.update(time_features)
-                        features.update(freq_features)
-                        features.update(envelope_features)
-                        features.update(timefreq_features)
-
-                        features_list.append(features)
-
-                    all_features.extend(features_list)
-
-            return pd.DataFrame(all_features)
-
         else:
-            # 处理CSV/TXT文件 (目标域数据)
             data = self.read_csv_txt_file(file_path)
-            if data is None:
-                return None
+        if data is None:
+            return None
 
+        # 获取标签信息
+        if label is None:
+            label = data['fault_info']['fault_type']
+
+        # 获取转速信息
+        if rpm is None:
+            rpm = data.get('RPM', data['fault_info'].get('rpm', 1797))  # 优先使用文件名中的rpm，默认1797
+
+        # 处理源域多传感器数据或目标域单一信号
+        all_features = []
+        if 'DE' in data or 'FE' in data or 'BA' in data:
+            sensors = [s for s in ['DE', 'FE', 'BA'] if s in data]
+            for sensor in sensors:
+                signal_data = data[sensor]
+                original_fs = data.get('fs', 12000)
+
+                logging.info(f"  处理{sensor}传感器数据，原始采样率: {original_fs} Hz")
+
+                # 重采样
+                resampled_signal = self.resample_signal(signal_data, original_fs)
+                logging.info(f"  重采样后长度: {len(resampled_signal)} 点")
+
+                # 分段处理
+                segments = self.sliding_window_segmentation(resampled_signal, rpm)
+                logging.info(f"  分段数量: {len(segments)}")
+
+                # 确定轴承类型
+                bearing_type = 'SKF6205' if sensor == 'DE' else 'SKF6203'
+
+                # 计算轴承特征频率
+                bearing_freqs = self.calculate_bearing_frequencies(rpm, bearing_type)
+
+                # 提取特征
+                features_list = []
+                for i, segment in enumerate(segments):
+                    features = {}
+                    features['file'] = filename
+                    features['sensor'] = sensor
+                    features['segment'] = i
+                    features['label'] = label
+                    features['fault_size'] = data['fault_info']['fault_size']
+                    features['load'] = data['fault_info']['load']
+                    features['position'] = data['fault_info']['position']
+                    features['rpm'] = rpm
+                    features['bearing_type'] = bearing_type
+
+                    # 各类特征
+                    time_features = self.extract_time_features(segment)
+                    freq_features = self.extract_frequency_features(segment, bearing_freqs)
+                    envelope_features = self.extract_envelope_features(segment)
+                    filename_prefix = f"{os.path.splitext(filename)[0]}_{sensor}_seg{i}"
+                    timefreq_features = self.extract_timefreq_features(segment, save_images, filename_prefix)
+
+                    # 合并特征
+                    features.update(time_features)
+                    features.update(freq_features)
+                    features.update(envelope_features)
+                    features.update(timefreq_features)
+
+                    features_list.append(features)
+
+                all_features.extend(features_list)
+        else:
+            # 目标域数据
             signal_data = data['signal']
             original_fs = data['fs']
-
-            # 从文件名推断标签 (A-P编号)
-            filename = os.path.basename(file_path)
             file_id = filename.split('.')[0].split('_')[0]
 
-            print(f"  目标域数据，文件ID: {file_id}")
-            print(f"  原始采样率: {original_fs} Hz，数据长度: {len(signal_data)} 点")
+            logging.info(f"  目标域数据，文件ID: {file_id}")
+            logging.info(f"  原始采样率: {original_fs} Hz，数据长度: {len(signal_data)} 点")
 
             # 重采样
             resampled_signal = self.resample_signal(signal_data, original_fs)
-            print(f"  重采样后长度: {len(resampled_signal)} 点")
+            logging.info(f"  重采样后长度: {len(resampled_signal)} 点")
 
             # 分段处理
-            segments = self.sliding_window_segmentation(resampled_signal)
-            print(f"  分段数量: {len(segments)}")
+            segments = self.sliding_window_segmentation(resampled_signal, rpm)
+            logging.info(f"  分段数量: {len(segments)}")
 
             # 计算轴承特征频率 (使用列车轴承转速约600 rpm)
             target_rpm = rpm if rpm is not None else 600
@@ -617,7 +651,7 @@ class BearingDataProcessor:
             features_list = []
             for i, segment in enumerate(segments):
                 features = {}
-                features['file'] = os.path.basename(file_path)
+                features['file'] = filename
                 features['file_id'] = file_id
                 features['sensor'] = 'single'
                 features['segment'] = i
@@ -632,7 +666,6 @@ class BearingDataProcessor:
                 time_features = self.extract_time_features(segment)
                 freq_features = self.extract_frequency_features(segment, bearing_freqs)
                 envelope_features = self.extract_envelope_features(segment)
-
                 filename_prefix = f"{file_id}_seg{i}"
                 timefreq_features = self.extract_timefreq_features(segment, save_images, filename_prefix)
 
@@ -644,11 +677,13 @@ class BearingDataProcessor:
 
                 features_list.append(features)
 
-            return pd.DataFrame(features_list)
+            all_features.extend(features_list)
+
+        return pd.DataFrame(all_features)
 
     def process_dataset(self, data_config, output_dir='./features', save_images=False):
         """
-        处理整个数据集
+        处理整个数据集，添加检查点机制
 
         Args:
             data_config: 数据配置字典
@@ -661,71 +696,93 @@ class BearingDataProcessor:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        all_features = []
+        # 创建检查点目录
+        checkpoint_dir = os.path.join(output_dir, 'checkpoints')
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
 
-        for config in data_config:
+        all_features = []
+        processed_files = set()
+
+        # 检查已处理的检查点文件
+        for checkpoint_file in os.listdir(checkpoint_dir):
+            if checkpoint_file.endswith('.csv'):
+                processed_files.add(checkpoint_file.replace('_features.csv', ''))
+
+        for i, config in enumerate(data_config):
             file_path = config['path']
+            filename = os.path.basename(file_path)
+            file_key = os.path.splitext(filename)[0]
+
+            # 检查是否已处理
+            if file_key in processed_files:
+                checkpoint_path = os.path.join(checkpoint_dir, f"{file_key}_features.csv")
+                try:
+                    features_df = pd.read_csv(checkpoint_path)
+                    all_features.append(features_df)
+                    print(f"已加载检查点文件: {checkpoint_path}")
+                    logging.info(f"已加载检查点文件: {checkpoint_path}")
+                    continue
+                except Exception as e:
+                    logging.warning(f"加载检查点文件 {checkpoint_path} 失败，将重新处理: {e}")
+
+            print(f"正在处理第 {i + 1}/{len(data_config)} 个文件: {config['path']}")
             label = config.get('label', 'unknown')
             rpm = config.get('rpm', None)
-
             features_df = self.process_file(file_path, label, rpm, save_images)
             if features_df is not None:
+                # 保存检查点
+                checkpoint_path = os.path.join(checkpoint_dir, f"{file_key}_features.csv")
+                features_df.to_csv(checkpoint_path, index=False)
+                logging.info(f"检查点已保存: {checkpoint_path}")
                 all_features.append(features_df)
 
         # 合并所有特征
         if all_features:
             final_df = pd.concat(all_features, ignore_index=True)
 
+            # 特征完整性检查
+            if final_df.isnull().any().any():
+                logging.warning("特征数据中存在缺失值")
+
+            # 统一标准化
+            numeric_features = final_df.select_dtypes(include=[np.number]).columns.tolist()
+            exclude_cols = ['segment', 'fault_size', 'load', 'rpm']
+            numeric_features = [col for col in numeric_features if col not in exclude_cols]
+            if numeric_features:
+                scaler = StandardScaler()
+                final_df[numeric_features] = scaler.fit_transform(final_df[numeric_features])
+                joblib.dump(scaler, os.path.join(output_dir, 'feature_scaler.pkl'))
+                logging.info("特征标准化完成")
+
             # 保存特征
             output_file = os.path.join(output_dir, 'extracted_features.csv')
             final_df.to_csv(output_file, index=False)
-            print(f"特征已保存到: {output_file}")
+            logging.info(f"特征已保存到: {output_file}")
             print(f"总特征数: {len(final_df.columns)}")
             print(f"总样本数: {len(final_df)}")
 
             # 分别保存源域和目标域特征
-            if 'file_id' in final_df.columns:
-                # 分离源域和目标域数据
-                source_df = final_df[final_df['file_id'].isna()]
-                target_df = final_df[~final_df['file_id'].isna()]
+            source_df = final_df[final_df['file_id'].isna()]
+            target_df = final_df[~final_df['file_id'].isna()]
 
-                if len(source_df) > 0:
-                    source_file = os.path.join(output_dir, 'source_domain_features.csv')
-                    source_df.to_csv(source_file, index=False)
-                    print(f"源域特征已保存: {len(source_df)} 个样本")
+            if len(source_df) > 0:
+                source_file = os.path.join(output_dir, 'source_domain_features.csv')
+                source_df.to_csv(source_file, index=False)
+                logging.info(f"源域特征已保存: {len(source_df)} 个样本")
 
-                if len(target_df) > 0:
-                    target_file = os.path.join(output_dir, 'target_domain_features.csv')
-                    target_df.to_csv(target_file, index=False)
-                    print(f"目标域特征已保存: {len(target_df)} 个样本")
+            if len(target_df) > 0:
+                target_file = os.path.join(output_dir, 'target_domain_features.csv')
+                target_df.to_csv(target_file, index=False)
+                logging.info(f"目标域特征已保存: {len(target_df)} 个样本")
+
+            # 生成特征报告
+            generate_feature_report(final_df, os.path.join(output_dir, 'feature_report.txt'))
+
+            return final_df
         else:
-            print("没有成功处理任何文件")
+            logging.error("没有成功处理任何文件")
             return None
-
-        # 特征标准化（可选）
-        print("\n进行特征标准化...")
-        numeric_features = features_df.select_dtypes(include=[np.number]).columns
-        # 排除元数据列
-        exclude_cols = ['segment', 'fault_size', 'load', 'rpm']
-        numeric_features = [col for col in numeric_features if col not in exclude_cols]
-
-        if len(numeric_features) > 0:
-            scaler = StandardScaler()
-            features_df_normalized = features_df.copy()
-            features_df_normalized[numeric_features] = scaler.fit_transform(features_df[numeric_features])
-
-            # 保存标准化后的特征
-            features_df_normalized.to_csv('./extracted_features/normalized_features.csv', index=False)
-            print(f"标准化特征已保存: {len(numeric_features)} 个数值特征")
-
-            # 保存标准化器
-            joblib.dump(scaler, './extracted_features/feature_scaler.pkl')
-            print("特征标准化器已保存")
-
-        # 生成特征报告
-        generate_feature_report(features_df, './extracted_features/feature_report.txt')
-
-        return final_df
 
 
 def generate_feature_report(df, output_path):
@@ -791,28 +848,33 @@ def generate_feature_report(df, output_path):
             f.write(f"   最小值范围: [{stats.loc['min'].min():.6f}, {stats.loc['min'].max():.6f}]\n")
             f.write(f"   最大值范围: [{stats.loc['max'].min():.6f}, {stats.loc['max'].max():.6f}]\n\n")
 
-        f.write("7. 处理配置\n")
+        # 特征完整性
+        missing = df.isnull().sum().sum()
+        f.write(f"7. 特征完整性: 缺失值总数 {missing}\n\n")
+
+        # 处理配置
+        f.write("8. 处理配置\n")
         f.write("   目标采样率: 48000 Hz\n")
-        f.write("   窗口大小: 1.0 秒\n")
-        f.write("   步长: 0.5 秒\n")
+        f.write("   窗口大小: 动态 (至少10个旋转周期)\n")
+        f.write("   步长: 窗口大小/2\n")
         f.write("   轴承参数: SKF6205(DE), SKF6203(FE)\n\n")
 
         f.write("报告生成完毕。\n")
 
-    print(f"特征报告已保存到: {output_path}")
+    logging.info(f"特征报告已保存到: {output_path}")
+
 
 def main():
     """主函数示例 - 适配您的数据集结构"""
     # 初始化处理器
     processor = BearingDataProcessor(
         target_fs=48000,
-        window_size=1.0,
+        window_size=1.0,  # 初始值，实际动态调整
         step_size=0.5
     )
 
-    # 源域数据配置 (48kHz_DE_data)
+    # 源域数据配置
     source_data_config = []
-
     # 自动扫描源域数据文件夹
     source_base_path = os.path.join(data_dir, '源域数据集', '48kHz_DE_data')  # 源域数据路径
 
@@ -864,16 +926,18 @@ def main():
 
     # 目标域数据配置 (列车轴承数据A-P)
     target_data_config = []
-    target_base_path = os.path.join(data_dir, '目标域数据集')   # 修改为您的目标域数据路径
+    target_base_path = os.path.join(data_dir, '目标域数据集')
+    if not os.path.exists(target_base_path):
+        logging.error(f"目标域数据路径不存在: {target_base_path}")
+        return
 
-    if os.path.exists(target_base_path):
-        for file in os.listdir(target_base_path):
-            if file.endswith(('.csv', '.txt', '.mat')) and any(file.startswith(c) for c in 'ABCDEFGHIJKLMNOP'):
-                target_data_config.append({
-                    'path': os.path.join(target_base_path, file),
-                    'label': 'unknown',  # 目标域标签未知
-                    'rpm': 600  # 列车轴承转速约600 rpm
-                })
+    for file in os.listdir(target_base_path):
+        if file.endswith('.mat') and any(file.startswith(c) for c in 'ABCDEFGHIJKLMNOP'):
+            target_data_config.append({
+                'path': os.path.join(target_base_path, file),
+                'label': 'unknown',  # 目标域标签未知
+                'rpm': 600  # 列车轴承转速约600 rpm
+            })
 
     # 合并所有数据配置
     all_data_config = source_data_config + target_data_config
@@ -890,7 +954,7 @@ def main():
     features_df = processor.process_dataset(
         all_data_config,
         output_dir='./extracted_features',
-        save_images=True  # 设置为True可保存时频分析图像
+        save_images=False  # 设置为True可保存时频分析图像，注意存储空间
     )
 
     if features_df is not None:
@@ -910,21 +974,6 @@ def main():
             print(f"\n轴承类型分布:")
             print(features_df['bearing_type'].value_counts())
 
-        # 分别保存源域和目标域特征
-        if 'file_id' in features_df.columns:
-            # 分离源域和目标域数据
-            source_df = features_df[features_df['file_id'].isna()]
-            target_df = features_df[~features_df['file_id'].isna()]
-
-            if len(source_df) > 0:
-                source_file = os.path.join('./extracted_features', 'source_domain_features.csv')
-                source_df.to_csv(source_file, index=False)
-                print(f"源域特征已保存: {len(source_df)} 个样本")
-
-            if len(target_df) > 0:
-                target_file = os.path.join('./extracted_features', 'target_domain_features.csv')
-                target_df.to_csv(target_file, index=False)
-                print(f"目标域特征已保存: {len(target_df)} 个样本")
 
 if __name__ == "__main__":
     print(f"当前工作目录: {code_dir}, 项目根目录: {root_dir}, 数据集目录: {data_dir}")
