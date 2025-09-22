@@ -957,6 +957,7 @@ def main():
         save_images=False  # 设置为True可保存时频分析图像，注意存储空间
     )
 
+    # 显示特征统计
     if features_df is not None:
         # 显示特征统计
         print("\n=== 特征提取完成 ===")

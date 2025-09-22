@@ -15,7 +15,7 @@ pip install torch torchvision torchaudio numpy pandas matplotlib seaborn scikit-
 作者: 轴承故障诊断专家
 日期: 2025年
 """
-
+import json
 import os
 import logging
 import argparse
@@ -30,7 +30,6 @@ import seaborn as sns
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -39,14 +38,16 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 
-from scipy import signal
-from scipy.fft import stft
+from scipy.signal import stft
 
 import warnings
 
 warnings.filterwarnings('ignore')
 
-
+code_dir = os.getcwd()
+root_dir = os.path.dirname(code_dir)
+data_dir = os.path.join(root_dir, '数据集')
+extracted_features_dir = os.path.join(root_dir, 'extracted_features')
 # 设置随机种子
 def set_seed(seed=42):
     """设置随机种子确保可复现性"""
@@ -65,7 +66,7 @@ class BearingDataset(Dataset):
     """轴承数据集类"""
 
     def __init__(self, data, labels, model_type='1d_resnet', fs=48000,
-                 normalize=True, augment=False):
+                 normalize=True, augment=False, training=False):
         """
         初始化数据集
 
@@ -83,6 +84,7 @@ class BearingDataset(Dataset):
         self.fs = fs
         self.normalize = normalize
         self.augment = augment
+        self.training = training
 
         # 标准化
         if normalize:
@@ -754,7 +756,7 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='轴承故障分类基线模型训练')
     parser.add_argument('--data_path', type=str,
-                        default='./extracted_features/source_domain_features.csv',
+                        default=os.path.join(extracted_features_dir, 'source_domain_features.csv'),
                         help='源域特征文件路径')
     parser.add_argument('--batch_size', type=int, default=64, help='批大小')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
@@ -800,11 +802,11 @@ def main():
 
 
         train_dataset = BearingDataset(train_split[0], train_split[1],
-                                       model_type=model_type, augment=True)
+                                       model_type=model_type, augment=True, training=True)
         val_dataset = BearingDataset(val_split[0], val_split[1],
-                                     model_type=model_type, augment=False)
+                                     model_type=model_type, augment=False, training=False)
         test_dataset = BearingDataset(test_split[0], test_split[1],
-                                      model_type=model_type, augment=False)
+                                      model_type=model_type, augment=False, training=False)
 
         # 数据加载器
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
@@ -887,7 +889,6 @@ def main():
             'class_names': class_names.tolist()
         }
 
-        import json
         result_file = os.path.join(result_dir, f'{model_type}_results.json')
         with open(result_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
@@ -914,29 +915,8 @@ if __name__ == "__main__":
     print("  feature_mlp: MLP处理手工特征")
     print()
 
-    # 检查依赖库
-    required_packages = [
-        'torch', 'torchvision', 'numpy', 'pandas', 'matplotlib',
-        'seaborn', 'scikit-learn', 'scipy'
-    ]
-
-    print("检查依赖库...")
-    missing_packages = []
-    for package in required_packages:
-        try:
-            __import__(package.replace('-', '_').lower())
-        except ImportError:
-            missing_packages.append(package)
-
-    if missing_packages:
-        print(f"缺少以下依赖库: {', '.join(missing_packages)}")
-        print(f"请运行: pip install {' '.join(missing_packages)}")
-        exit(1)
-
-    print("所有依赖库检查通过！")
-
     # 检查是否存在数据文件
-    default_data_path = './extracted_features/source_domain_features.csv'
+    default_data_path = os.path.join(extracted_features_dir, 'source_domain_features.csv')
 
     if not os.path.exists(default_data_path):
         print(f"\n未找到数据文件: {default_data_path}")
